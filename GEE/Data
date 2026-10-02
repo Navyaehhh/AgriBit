@@ -1,0 +1,401 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var Sentinel1 = ee.ImageCollection("COPERNICUS/S1_GRD"),
+    Sentinel2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED"),
+    AOI = 
+    /* color: #98ff00 */
+    /* shown: false */
+    ee.Geometry.Polygon(
+        [[[80.92191621862297, 26.76585144689034],
+          [80.9976888874497, 26.776903014727193],
+          [81.01654906091179, 26.87103804657339],
+          [80.9291158480054, 26.933741841365933],
+          [80.88254101875697, 26.913585289325017],
+          [80.85521187119586, 26.873825467709565],
+          [80.84959171406022, 26.840511859633978],
+          [80.88790654321595, 26.802294951717478]]]),
+    CHIRPS = ee.ImageCollection("UCSB-CHG/CHIRPS/PENTAD"),
+    ERA5 = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+// =====================================================
+// PHASE 1: SCIENTIFICALLY CORRECTED PIPELINE
+// Optical + Microwave for AI-Driven Crop Type, Stress & Irrigation Advisory
+// =====================================================
+// ------------------- SETTINGS -------------------
+Map.centerObject(AOI, 8);
+print('AOI Area (km²):', AOI.area().divide(1e6));
+var startDate = ee.Date('2024-06-01');
+var endDate   = ee.Date('2025-10-01');
+var stepDays  = 15;
+// Metrological data
+// CHRIPS DATA
+var chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterBounds(AOI).filterDate(startDate, endDate);
+//  ERA5 DATA
+var era5 = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY').filterBounds(AOI).filterDate(startDate, endDate);
+// MODIS PET
+var pet = ee.ImageCollection('MODIS/061/MOD16A2').filterBounds(AOI).filterDate(startDate, endDate);
+// Optional: Multi-year baseline for robust VCI (highly recommended)
+var historicalStart = ee.Date('2018-06-01');
+// =====================================================
+// 1. GENERIC COMPOSITE FUNCTION
+// =====================================================
+// =====================================================
+// METEOROLOGICAL COMPOSITE (15-day)
+// =====================================================
+function getMetData(start, end) {
+  var rain = chirps.filterDate(start, end).sum().clip(AOI).rename('Rain');
+  var temp = era5.select('temperature_2m').filterDate(start, end).mean().subtract(273.15).clip(AOI).rename('Temp');
+  var soil = era5.select('volumetric_soil_water_layer_1').filterDate(start, end).mean().multiply(100).clip(AOI).rename('SoilMoisture');
+  var petImg = pet.select('PET').filterDate(start, end).sum().multiply(0.1).clip(AOI).rename('PET');
+  var waterDeficit = rain.subtract(petImg).clip(AOI).rename('WaterDeficit');
+  return ee.Image.cat([rain, temp, soil, petImg]);
+}
+function createMetCollection() {
+  var nSteps = endDate.difference(startDate, 'day').divide(stepDays).floor();
+  var periods = ee.List.sequence(0, nSteps.subtract(1));
+  return ee.ImageCollection.fromImages(periods.map(function(i){
+      i = ee.Number(i);
+      var start = startDate.advance(i.multiply(stepDays),'day');
+      var end   = start.advance(stepDays,'day');
+      return getMetData(start,end)
+          .set({
+              'system:time_start': start.millis(),
+              'date': start.format('YYYY-MM-dd')
+          });
+    })
+  );
+}
+var metDataCollection = createMetCollection();
+var metTest = getMetData(ee.Date('2024-06-01'),ee.Date('2025-06-01'));
+print(metDataCollection);
+print('Meteorological Data', metTest,metDataCollection );
+// =====================================================
+// GENERIC 15-DAY COMPOSITE FUNCTION
+// =====================================================
+function createComposites(collection) {
+  var nSteps = endDate.difference(startDate, 'day').divide(stepDays).floor();
+  var periods = ee.List.sequence(0, nSteps.subtract(1));
+  return ee.ImageCollection.fromImages(
+    periods.map(function(i) {
+      i = ee.Number(i);
+      var start = startDate.advance(i.multiply(stepDays), 'day');
+      var end = start.advance(stepDays, 'day');
+      var subset = collection.filterDate(start, end);
+      var composite = subset.median();
+      var metData = getMetData(start, end);
+      return composite.addBands(metData).clip(AOI)
+          .set({
+            'system:time_start': start.millis(),
+            'date': start.format('YYYY-MM-dd'),
+            'image_count': subset.size()
+          });
+    })
+  ).filter(ee.Filter.gt('image_count', 0));
+}
+// =====================================================
+// 2. SENTINEL-1 (MICROWAVE) PROCESSING
+// =====================================================
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(AOI)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.eq('instrumentMode','IW'))
+  .select(['VV','VH'])
+  .map(refinedLee);
+// RefinedLee Filter
+function refinedLee(img) {
+  var bandNames = img.bandNames();
+  var result = ee.ImageCollection(bandNames.map(function(b) {
+    var band = img.select([b]);
+    var weights3 = ee.List.repeat(ee.List.repeat(1,3),3);
+    var kernel3 = ee.Kernel.fixed(3,3,weights3,1,1,false);
+    var mean3 = band.reduceNeighborhood({
+      reducer: ee.Reducer.mean(),
+      kernel: kernel3
+    });
+    var variance3 = band.reduceNeighborhood({
+      reducer: ee.Reducer.variance(),
+      kernel: kernel3
+    });
+    var sample_weights = ee.List([
+      [0,0,0,0,0,0,0],
+      [0,1,0,1,0,1,0],
+      [0,0,0,0,0,0,0],
+      [0,1,0,1,0,1,0],
+      [0,0,0,0,0,0,0],
+      [0,1,0,1,0,1,0],
+      [0,0,0,0,0,0,0]
+    ]);
+    var sample_kernel = ee.Kernel.fixed(7,7,sample_weights,3,3,false);
+    var sample_mean = mean3.neighborhoodToBands(sample_kernel);
+    var sample_var = variance3.neighborhoodToBands(sample_kernel);
+    var gradients = sample_mean.select(1).subtract(sample_mean.select(7)).abs();
+    gradients = gradients.addBands(sample_mean.select(6).subtract(sample_mean.select(2)).abs());
+    gradients = gradients.addBands(sample_mean.select(3).subtract(sample_mean.select(5)).abs());
+    gradients = gradients.addBands(sample_mean.select(0).subtract(sample_mean.select(8)).abs());
+    var max_gradient = gradients.reduce(ee.Reducer.max());
+    var varX = sample_var.reduce(ee.Reducer.mean());
+    var bCoef = varX.divide(varX.add(mean3.pow(2)));
+    var filtered = mean3.add(bCoef.multiply(band.subtract(mean3))
+    );
+    return filtered.rename(ee.String(b));
+  }));
+  return result.toBands().rename(bandNames).copyProperties(img, img.propertyNames());
+}
+print('Raw S1 Images:', s1.size());
+function addSAR(img) {
+  var filtered = img.focalMedian(20, 'circle', 'meters'); // Improved filter size
+  var vv = ee.Image(10).pow(filtered.select('VV').divide(10));
+  var vh = ee.Image(10).pow(filtered.select('VH').divide(10));
+  var ratio = vv.divide(vh).rename('VV_VH');
+  var rvi   = vh.multiply(4).divide(vv.add(vh)).rename('RVI');
+  var diff  = filtered.select('VH').subtract(filtered.select('VV')).rename('VH_minus_VV');
+  return filtered.addBands([ratio, rvi, diff]).copyProperties(img, ['system:time_start']);
+}
+var s1Indexed = s1.map(addSAR);
+var s1Composites = createComposites(s1Indexed);
+print('S1 Composites:', s1Composites.size());
+// SAR Anomalies (relative to seasonal mean)
+var sarMean = s1Composites.select(['VV', 'VH', 'RVI']).mean();
+var s1Anomaly = s1Composites.map(function(img) {
+  return img.addBands([
+    img.select('VV').subtract(sarMean.select('VV')).rename('VV_anomaly'),
+    img.select('VH').subtract(sarMean.select('VH')).rename('VH_anomaly'),
+    img.select('RVI').subtract(sarMean.select('RVI')).rename('RVI_anomaly')
+  ]);
+});
+// =====================================================
+// 3. SENTINEL-2 (OPTICAL) PROCESSING
+// =====================================================
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(AOI)
+  .filterDate(startDate, endDate);
+print('Raw S2 Images:', s2.size());
+// Improved Cloud Masking (Scientific Standard)
+function maskClouds(img) {
+  var scl = img.select('SCL');
+  var mask = scl.neq(0)  // No data
+    .and(scl.neq(1))    // Saturated/defective
+    .and(scl.neq(3))    // Cloud shadows
+    .and(scl.neq(8))    // Cloud medium prob
+    .and(scl.neq(9))    // Cloud high prob
+    .and(scl.neq(10))   // Thin cirrus
+    .and(scl.neq(6));   // Water (if focusing on vegetation)
+  var qa = img.select('QA60');
+  var cloudBit = 1 << 10;
+  var cirrusBit = 1 << 11;
+  var clearQA = qa.bitwiseAnd(cloudBit).eq(0).and(qa.bitwiseAnd(cirrusBit).eq(0));
+  return img.updateMask(mask.and(clearQA))
+            .copyProperties(img, ['system:time_start']);
+}
+var clean = s2.map(maskClouds);
+// =====================================================
+// 4. VEGETATION INDICES
+// =====================================================
+function addIndices(img) {
+  var s = img.divide(10000);
+  var ndvi  = s.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  var ndmi  = s.normalizedDifference(['B8', 'B11']).rename('NDMI');
+  var ndre  = s.normalizedDifference(['B8', 'B5']).rename('NDRE');
+  var gndvi = s.normalizedDifference(['B8', 'B3']).rename('GNDVI');
+  var ndwi  = s.normalizedDifference(['B3', 'B8']).rename('NDWI');
+  var evi = s.expression('2.5 * ((NIR - RED) / (NIR + 6*RED - 7.5*BLUE + 1))', {
+      NIR: s.select('B8'), RED: s.select('B4'), BLUE: s.select('B2')
+    }).rename('EVI');
+  var msavi = s.expression('0.5 * (2*NIR + 1 - sqrt(pow(2*NIR + 1, 2) - 8*(NIR - RED)))', {
+      NIR: s.select('B8'), RED: s.select('B4')
+    }).rename('MSAVI');
+  return img.addBands([ndvi, ndmi, ndre, gndvi, ndwi, evi, msavi]);
+}
+var s2Indexed = clean.map(addIndices);
+var s2Composites = createComposites(s2Indexed);
+print('S2 Composites:', s2Composites.size());
+// =====================================================
+// 5. NDVI ANOMALY + VCI (with Multi-year Note)
+// =====================================================
+var historicalMeanNDVI = s2Indexed.filterDate(historicalStart, endDate).select('NDVI').mean();
+var anomalyCollection = s2Composites.map(function(img) {
+  var anomaly = img.select('NDVI').subtract(historicalMeanNDVI).rename('NDVI_anomaly');
+  return img.addBands(anomaly);
+});
+// VCI - Single year (replace with historical for better science)
+var ndviHistory = s2Indexed.filterDate(historicalStart, endDate).select('NDVI');
+var ndviMin = ndviHistory.min();
+var ndviMax = ndviHistory.max();
+var vciCollection = anomalyCollection.map(function(img) {
+  var vci = img.select('NDVI')
+    .subtract(ndviMin)
+    .divide(ndviMax.subtract(ndviMin))
+    .multiply(100)
+    .clamp(0, 100)
+    .rename('VCI');
+  return img.addBands(vci);
+});
+// =====================================================
+// 6. TEMPORAL SMOOTHING (Improved for Phenology)
+// =====================================================
+var analysisBands = ['NDVI', 'NDMI', 'NDRE', 'EVI', 'MSAVI', 'VCI', 'NDVI_anomaly'];
+var smoothCollection = vciCollection.map(function(img) {
+  var date = ee.Date(img.get('system:time_start'));
+  var window = vciCollection.filterDate(
+    date.advance(-30, 'day'), 
+    date.advance(30, 'day')
+  ).select(analysisBands);
+  return window.mean().set({
+    'system:time_start': date.millis(),
+    'date': date.format('YYYY-MM-dd')
+  });
+});
+// =====================================================
+// 7. JOINT OPTICAL-SAR (Recommended for AI)
+// =====================================================
+var joinedCollection = smoothCollection.map(function(opt) {
+  var date = ee.Date(opt.get('system:time_start'));
+  var sarMatch = s1Anomaly.filterDate(date.advance(-8,'day'), date.advance(5,'day')).mean();
+  return opt.addBands(sarMatch.select(['RVI','VV_VH','VV_anomaly','RVI_anomaly']));
+});
+function joinCollections(col1, col2) {
+  var filter = ee.Filter.equals({
+    leftField: 'system:time_start',
+    rightField: 'system:time_start'
+  });
+  var joined = ee.Join.inner().apply(col1, col2, filter);
+  return ee.ImageCollection(joined.map(function(f) {
+      var img1 = ee.Image(f.get('primary'));
+      var img2 = ee.Image(f.get('secondary'));
+      return img1.addBands(img2).copyProperties(img1, img1.propertyNames());
+    })
+  );
+}
+/*var training = smoothCollection.map(function(img) {
+  var date = ee.Date(img.get('system:time_start'));
+  var s1 = s1Composites.filterDate(date.advance(-8,'day'), date.advance(8,'day')).mean();
+  var met = metDataCollection.filterDate(date.advance(-8,'day'), date.advance(8,'day')).mean();
+  return img.addBands(s1).addBands(met);}).median().sampleRegions({
+  collection: samples,
+  properties: ['class'],
+  scale: 10
+});*/
+var merged = joinCollections(joinCollections(smoothCollection, s1Composites),metDataCollection);
+// =====================================================
+// 8. VISUALIZATION
+// =====================================================
+var firstOptical = ee.Image(vciCollection.first());
+var firstSAR = ee.Image(s1Anomaly.first());
+Map.addLayer(firstOptical, {bands: ['B8','B4','B3'], min:0, max:3000}, 'FCC');
+Map.addLayer(firstOptical.select('NDVI'), {min:0, max:0.9, palette: ['white','yellow','green']}, 'NDVI');
+Map.addLayer(firstOptical.select('VCI'), {min:0, max:100, palette: ['red','yellow','green']}, 'VCI', false);
+
+Map.addLayer(firstSAR.select('VV'), {min:-25, max:-5}, 'VV', false);
+Map.addLayer(firstSAR.select('RVI'), {min:0, max:2, palette: ['blue','white','green']}, 'RVI', false);
+
+Map.addLayer(metTest.select('Rain'),{min: 0, max: 300, palette: ['white', 'cyan', 'blue', 'darkblue']},'Rainfall');
+Map.addLayer(metTest.select('Temp'),{min: 0, max: 60, palette: ['white','blue', 'yellow', 'orange', 'red']},'Temperature');
+Map.addLayer(metTest.select('SoilMoisture'),{min: 0, max: 0.5, palette: ['brown', 'green']},'Soil Moisture');
+Map.addLayer(metTest.select('PET'),{min: 0, max: 100, palette: ['white', 'orange', 'red']},'PET');
+// =====================================================
+// 9. TIME SERIES CHARTS (Improved Scale)
+// =====================================================
+var S2chart =ui.Chart.image.series({
+  imageCollection:merged.select('NDVI','EVI','NDRE','NDMI','MSAVI'),
+  region: AOI,
+  reducer:ee.Reducer.mean(),
+  scale:100})
+  .setOptions({
+  title: 'Sentinel-2: Time Series Curve',
+  hAxis:{title:'Time Duration'},
+  vAxis:{title:'Vegetation Indices'}
+});
+print(S2chart);
+
+var S1chart=ui.Chart.image.series({
+  imageCollection: merged.select(['VV','VH']),
+  region: AOI,
+  reducer: ee.Reducer.mean(),
+  scale: 100
+}).setOptions({
+  title: 'Sentinel-1: SAR Metrics',
+  hAxis: {title: 'Time Duration'},
+  vAxis: {title: 'Value'}
+});
+print(S1chart);
+
+  
+var chart = ui.Chart.image.series({
+  imageCollection: metDataCollection.select('Rain','PET'),
+  region: AOI,
+  reducer: ee.Reducer.mean(),
+  scale: 5000,
+  xProperty: 'system:time_start'
+}).setOptions({
+  title: 'Rainfall (scaled) vs PET',
+  hAxis: {title: 'Date'},
+  vAxes: {
+    0: {title: 'Rainfall (mm/10)'},
+    1: {title: 'PET'}
+  },
+  series: {
+    0: {targetAxisIndex: 0, color: 'blue'}, // Rain
+    1: {targetAxisIndex: 1, color: 'red'}   // PET
+  }
+});
+print(chart);
+//
+
+var chart2 = ui.Chart.image.series({
+  imageCollection: metDataCollection.select('Rain','SoilMoisture'),
+  region: AOI,
+  reducer: ee.Reducer.mean(),
+  scale: 5000,
+  xProperty: 'system:time_start'
+}).setOptions({
+  title: 'Rainfall (scaled) vs Temperature',
+  hAxis: {title: 'Date'},
+  vAxes: {
+    0: {title: 'Rainfall (mm/10)'},
+    1: {title: 'Soil Moisture (%)'}
+  },
+  series: {
+    0: {targetAxisIndex: 0, color: 'blue'}, // Rain
+    1: {targetAxisIndex: 1, color: 'brown'}   // Soil Moisture
+  }
+});
+print(chart2);
+var chart3 = ui.Chart.image.series({
+  imageCollection:merged.select('Rain','NDVI'),
+  region: AOI,
+  reducer: ee.Reducer.mean(),
+  scale: 5000,
+  xProperty: 'system:time_start'
+}).setOptions({
+  title: 'Rainfall (scaled) vs NDVI',
+  hAxis: {title: 'Date'},
+  vAxes: {
+    0: {title: 'Rainfall (mm/10)'},
+    1: {title: 'NDVI'},
+  },
+  series: {
+    0: {targetAxisIndex: 0, color: 'blue'}, // Rain
+    1: {targetAxisIndex: 1, color: 'green'}   // NDVI
+  }
+});
+print(chart3);
+
+
+var chart4 = ui.Chart.image.series({
+  imageCollection:merged.select('RVI','SoilMoisture'),
+  region: AOI,
+  reducer: ee.Reducer.mean(),
+  scale: 5000,
+  xProperty: 'system:time_start'
+}).setOptions({
+  title: 'Rainfall (scaled) vs NDVI',
+  hAxis: {title: 'Date'},
+  vAxes: {
+    0: {title: 'RVI'},
+    1: {title: 'Soil Moisture'},
+  },
+  series: {
+    0: {targetAxisIndex: 0, color: 'blue'}, // Rain
+    1: {targetAxisIndex: 1, color: 'brown'}   // NDVI
+  }
+});
+print(chart4);
