@@ -1,0 +1,3 @@
+[submodule "GEE"]
+	path = GEE
+	url = https://earthengine.googlesource.com/users/AgriBit/AgriBit
