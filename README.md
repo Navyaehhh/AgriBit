@@ -29,18 +29,18 @@ Accurate and timely identification of crop types, detection of moisture stress a
 
 # Multi-Source Data Fusion
 AgriBit is designed around the complementary capabilities of optical, microwave and ancillary datasets.
-| Data Source | Primary Use | 
-|---|---|---|
-Sentinel-2|	Vegetation, spectral signatures and phenology|
-Landsat|	Multi-temporal optical observations|
-MODIS|	Vegetation dynamics and supporting temporal information|
-LISS-III / AWiFS|	Indian Earth observation data|
-Sentinel-1|	SAR backscatter and all-weather monitoring|
-EOS-05|	Microwave/SAR observations|
-Rainfall|	Water availability and stress interpretation|
-Reference ET / Weather Data|	Crop water-demand estimation|
-Command-Area Boundaries|	Irrigation planning|
-Ground Truth|	Training and validation|
+| Data Source              | Primary Use                                   |
+|--------------------------|-----------------------------------------------|
+| Sentinel-2               | Vegetation, spectral signatures and phenology |
+| Landsat                  | Multi-temporal optical observations           |
+| MODIS                    | Vegetation dynamics and supporting temporal information |
+| LISS-III / AWiFS         | Indian Earth observation data                 |
+| Sentinel-1               | SAR backscatter and all-weather monitoring    |
+| EOS-05                   | Microwave/SAR observations                    |
+| Rainfall                 | Water availability and stress interpretation  |
+| Reference ET / Weather Data | Crop water-demand estimation              |
+| Command-Area Boundaries  | Irrigation planning                           |
+| Ground Truth             | Training and validation                       |
 
 Most of these datasets are available through national or international Earth-observation portals, making the proposed architecture suitable for rapid prototyping and future operational scaling.
 # Pilot Area
@@ -85,22 +85,22 @@ flowchart TD
     L --> M
 ```
 
-## Data Preprocessing
-# Optical Data
+# Data Preprocessing
+## Optical Data
 Pre-processing may include:
 - Atmospheric correction
 - Cloud and cloud-shadow masking
 - Quality assessment
 - Temporal compositing
-# SAR Data
+## SAR Data
 Pre-processing may include:
 - Speckle filtering
 - Refined Lee filtering
 - Radiometric processing
 - Temporal compositing
 
-## Feature Extraction 
-# Vegetation Features
+# Feature Extraction 
+## Vegetation Features
 Potential vegetation indices include:
 - NDVI
 - EVI
