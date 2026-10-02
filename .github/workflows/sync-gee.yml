@@ -1,0 +1,105 @@
+```yaml
+name: Sync GEE to AgriBit
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # Run every 30 minutes
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Get the AgriBit repository
+      - name: Checkout AgriBit
+        uses: actions/checkout@v4
+
+      # 2. Clone the latest GEE repository
+      - name: Clone GEE repository
+        run: |
+          git clone https://earthengine.googlesource.com/users/AgriBit/AgriBit gee-source
+
+      # 3. Replace AgriBit/GEE with the latest GEE files
+      - name: Sync GEE files
+        run: |
+          rm -rf GEE
+          mkdir -p GEE
+
+          cp -r gee-source/. GEE/
+
+          # Never copy GEE's Git metadata into AgriBit
+          rm -rf GEE/.git
+
+          # Remove temporary clone
+          rm -rf gee-source
+
+      # 4. Commit and push only if something changed
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add GEE
+
+          if git diff --cached --quiet; then
+            echo "No GEE changes detected."
+          else
+            git commit -m "Sync GEE repository"
+            git push
+          fi
+```
+```yaml
+name: Sync GEE to AgriBit
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout AgriBit
+        uses: actions/checkout@v4
+
+      - name: Clone GEE repository
+        run: |
+          git clone https://earthengine.googlesource.com/users/AgriBit/AgriBit gee-source
+
+      - name: Sync GEE files
+        run: |
+          rm -rf GEE
+          mkdir -p GEE
+
+          cp -r gee-source/. GEE/
+
+          rm -rf GEE/.git
+          rm -rf gee-source
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add GEE
+
+          if git diff --cached --quiet; then
+            echo "No GEE changes detected."
+          else
+            git commit -m "Sync GEE repository"
+            git push
+          fi
+```
+
